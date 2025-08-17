@@ -1,35 +1,94 @@
 import os
-import re
 import langchain
+from vector_db import VectorDatabase
+from typing import List
+from dotenv import load_dotenv
+from langchain_core.documents import Document
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
 from langchain_ollama import OllamaEmbeddings
 from langchain_ollama import OllamaLLM
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
+from langchain_core.output_parsers import StrOutputParser
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
 
 load_dotenv()
 
 
 class Chatbot:
+    bm25_retriever: BM25Retriever
+    loaded_documents: List[Document]
+    ensemble_retriever: EnsembleRetriever
+    SYSTEM_PROMPT: str
+    SYNONYMS_MAP: List[str]
+    vector_db: VectorDatabase
+    vector_retriever: object
+
     def __init__(
-        self, chunk_size: int, chunk_overlap: int, synonyms_map: map, ignored_docs: list
+        self,
+        chunk_size: int,
+        chunk_overlap: int,
+        ignored_docs: list,
+        md_headers_list: list,
     ):
-        self.model = OllamaLLM(model="llama3.2")
+        self.llm = OllamaLLM(model="llama3.2")
         self.embeddings = OllamaEmbeddings(model="all-minilm")
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
-        self.DOCUMENTS_PATH = "ug_ai/docs"
-        self.SYNONYMS_MAP = synonyms_map
-        self.loaded_documents = None
+        self.DOCUMENTS_PATH = "/home/ian/Univali/ug_ai/files"
         self.ignored_documents = ignored_docs
+        self.loaded_documents = []
         self.history = []
-        self.vector_db = None
-        langchain.verbose = False
-        langchain.debug = True
+        self.headers_to_split_on = md_headers_list
+        self.read_system_prompt()
+        self.parse_documents()
+        self.initialize_vector_db()
+        self.create_vector_retriever()
+        self.create_bm25_retriever()
+        self.initialize_ensamble_retriever()
+        self.qa_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", self.SYSTEM_PROMPT),
+                ("human", "{input}"),
+            ]
+        )
 
-    def sanitize_prompt(prompt):
+        langchain.verbose = False
+        langchain.debug = False
+
+    def read_system_prompt(self):
+        with open("system_prompt.txt", "r") as file:
+            self.SYSTEM_PROMPT = file.read()
+
+    def read_synonyms_map():
+        pass
+
+    def initialize_vector_db(self):
+        self.vector_db = VectorDatabase.initialize_db(
+            self.loaded_documents, self.embeddings
+        )
+
+    def create_vector_retriever(self):
+        self.vector_retriever = self.vector_db.as_retriever(
+            search_type="similarity_score_threshold",
+            search_kwargs={
+                "score_threshold": 0.25,
+                "k": 5,
+            },  # 1- 0.25 = 0.75 (cosine distance, not similarity)
+        )
+
+    def create_bm25_retriever(self):
+        self.bm25_retriever = BM25Retriever.from_documents(self.loaded_documents)
+        self.bm25_retriever.k = 5  # Retrieve top 2 results
+
+    def initialize_ensamble_retriever(self):
+        self.ensemble_retriever = EnsembleRetriever(
+            retrievers=[self.bm25_retriever, self.vector_retriever], weights=[0.4, 0.6]
+        )
+
+    def sanitize_prompt(self, prompt):
         print(prompt)
         return prompt
 
@@ -47,41 +106,20 @@ class Chatbot:
         for file_name in os.listdir(self.DOCUMENTS_PATH):
             if file_name in self.ignored_documents:
                 continue
-
             file_path = os.path.join(self.DOCUMENTS_PATH, file_name)
             loader = TextLoader(file_path, encoding="utf-8")
             loaded_file = loader.load()
-            loaded_raw_docs.extend(loaded_file)  # load file into list
+            loaded_raw_docs.extend(loaded_file)  # load raw file into list
             print(f"{file_name}: {len(loaded_file)}")
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=0)
-        self.loaded_documents = text_splitter.split_documents(loaded_raw_docs)
-
-        for doc in self.loaded_documents:
-            laws = re.findall(r"Lei Complementar nº \d+", doc.page_content)
-            decrees = re.findall(r"Decreto nº \d+", doc.page_content)
-            if not laws and not decrees:
-                doc.metadata["references"] = ",".join(list(set(laws + decrees)))
-
-            words = doc.page_content.split()
-            found_synonyms = set()
-            for word in words:
-                if word.lower() in self.SYNONYMS_MAP:
-                    found_synonyms.update(self.SYNONYMS_MAP[word])
-
-            if found_synonyms:
-                doc.metadata["synonyms"] = ",".join(found_synonyms)
+        markdown_splitter = MarkdownHeaderTextSplitter(self.headers_to_split_on)
+        for doc in loaded_raw_docs:
+            self.loaded_documents.extend(markdown_splitter.split_text(doc.page_content))
 
     def retrieve_relevant_docs(self, query):
-        retriever = self.vector_db.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"score_threshold": 0.25, "k": 6},
-        )
-
+        context_documents_str = ""
         if query:
-            expanded_query = self.expand_query(query, self.SYNONYMS_MAP)
-            print(expanded_query)
-            relevant_docs = retriever.invoke(expanded_query)
+            relevant_docs = self.ensemble_retriever.invoke(query)
 
             for doc in relevant_docs:
                 print(doc, "\n\n")
@@ -92,9 +130,20 @@ class Chatbot:
             self.history.append(
                 {"role": "user", "content": HumanMessage(content=query)}
             )
-            return context_documents_str
-        else:
-            return ""
+        return context_documents_str
 
-    def create_chain(self):
-        pass
+    def chain_function(self, query):
+        qa_prompt_local = self.qa_prompt.partial(
+            history=self.history, context=self.retrieve_relevant_docs(query)
+        )
+
+        llm_chain = (
+            {"input": RunnablePassthrough()}
+            | qa_prompt_local
+            | self.sanitize_prompt(qa_prompt_local)
+            | self.llm
+            | StrOutputParser()
+        )
+
+        llm_response = llm_chain.invoke(query)
+        return llm_response
